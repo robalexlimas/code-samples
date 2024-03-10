@@ -27,6 +27,14 @@
 
 #include <stdio.h>
 #include <curand.h>
+#include <stdlib.h>
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#ifndef __CUDACC__
+    #define __CUDACC__
+    #include <device_functions.h>
+#endif
 
 // Define some error checking macros.
 #define cudaErrCheck(stat) { cudaErrCheck_((stat), __FILE__, __LINE__); }
@@ -129,7 +137,7 @@ __global__ void wmma_example_mod(half *a, half *b, float *c, int M, int N, int K
    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
    int sublaneid;
-   asm("mov.u32 %0, %laneid;" :"=r"(sublaneid));
+   // asm("mov.u32 %0, %laneid;" :"=r"(sublaneid));
  
    // Declare the fragments
    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
