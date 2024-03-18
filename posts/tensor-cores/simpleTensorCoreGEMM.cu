@@ -127,7 +127,35 @@ __device__ void expand_device(half* out, half* in, int rows, int cols, int index
    }
 }
 
-__global__ void wmma_example_mod(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta) {
+__device__ void wmma_diagnosis(
+   wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragB,
+   wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float, void> fragC,
+   int M, int N, int K) {
+   int laneid;
+   asm("mov.u32 %0, %laneid;" :"=r"(laneid));
+   int bCol = (int)(laneid / 4);
+
+   __shared__ half bDiagnosis[16][16];
+
+   for (int i = 0; i < fragB.num_elements / 2; i++)
+   {
+      bDiagnosis[i][bCol] = fragB.x[i];
+   }
+
+   __syncthreads();
+
+   for (int i = 0; i < 16; i++) {
+      for (int j = 0; j < 16; j++) {
+         printf("%2.0f ", (float)bDiagnosis[i][j]);
+      }
+      printf("\n\n");
+   }
+
+   __syncthreads();
+
+}
+
+__global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta, int *fault) {
    // Leading dimensions. Packed with no transpositions.
    int lda = M;
    int ldb = K;
@@ -147,6 +175,7 @@ __global__ void wmma_example_mod(half *a, half *b, float *c, int M, int N, int K
    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag_1;
    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag_0;
    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag_1;
+   wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag_diagnosis;
    wmma::fill_fragment(acc_frag_0, 0.0f);
    wmma::fill_fragment(acc_frag_1, 0.0f);
 
@@ -162,50 +191,29 @@ __global__ void wmma_example_mod(half *a, half *b, float *c, int M, int N, int K
       if (aRow < M && aCol < K && bRow < K && bCol < N) {
          wmma::load_matrix_sync(a_frag, a + aRow + aCol * lda, lda);
 
-         // wmma::load_matrix_sync(b_frag_0, b_0, 16);
          wmma::load_matrix_sync(b_frag_0, b + bRow + bCol * ldb, ldb);
          wmma::load_matrix_sync(b_frag_1, b + bRow + bCol * ldb, ldb);
 
-         // if (sublaneid == 7) {
-         //    for(int i=0; i < 8; i++) { // * IMPORTANT: this value must be between 0 and 7, otherwise, it affects the other operations
-         //       if (i < 4)        // ! TCU 0
-         //          b_frag_0.x[i] = 0.0f;
-         //       else              // ! TCU 1
-         //          b_frag_0.x[i] = 10.0f;
-         //    }
+         // // * SAFE MODE TCU 0 <- TCU 1
+         // for(int i=0; i < b_frag_0.num_elements / 4; i++) {
+         //    b_frag_0.x[i] = b_frag_0.x[i + 4];
          // }
 
-         // * SAFE MODE TCU 0 <- TCU 1
-         for(int i=0; i < b_frag_0.num_elements / 4; i++) {
-            b_frag_0.x[i] = b_frag_0.x[i + 4];
-         }
-
-         // * SAFE MODE TCU 1 <- TCU 0
-         for(int i=0; i < b_frag_1.num_elements / 4; i++) {
-            b_frag_1.x[i + 4] = b_frag_1.x[i];
-         }
+         // // * SAFE MODE TCU 1 <- TCU 0
+         // for(int i=0; i < b_frag_1.num_elements / 4; i++) {
+         //    b_frag_1.x[i + 4] = b_frag_1.x[i];
+         // }
 
          // !emulate a faul inside the TCU 0 on only one column
-         // if (sublaneid == 0) { // * fault in the column 0
-         //    for(int i=0; i < 4; i++) {
-         //       if (i == 1) {
-         //          b_frag_0.x[i] = 0.0f;
-         //       }
-         //    }
-         // }
-
-         // * DIAGNOSIS MODE
-         // for(int i=0; i < b_frag_0.num_elements; i++) {
-         //    if (i < 2) {
-         //       b_frag_0.x[i] = 0.0f;
-         //    }
-         // }
-
          __syncthreads();
+         if (laneid == 0) { // * fault in the column 0
+            for(int i=0; i < 4; i++) {
+                  b_frag_0.x[i] = 0.0f;
+            }
+         }
 
          wmma::mma_sync(acc_frag_0, a_frag, b_frag_0, acc_frag_0);
          wmma::mma_sync(acc_frag_1, a_frag, b_frag_1, acc_frag_1);
-
       }
    }
 
@@ -216,7 +224,7 @@ __global__ void wmma_example_mod(half *a, half *b, float *c, int M, int N, int K
    if (cRow < M && cCol < N) {
       wmma::load_matrix_sync(c_frag_0, c + cRow + cCol * ldc, ldc, wmma::mem_row_major);
       wmma::load_matrix_sync(c_frag_1, c + cRow + cCol * ldc, ldc, wmma::mem_row_major);
-
+      wmma::load_matrix_sync(c_frag_diagnosis, c + cRow + cCol * ldc, ldc, wmma::mem_row_major);
 
       for(int i=0; i < c_frag_0.num_elements; i++) {
          c_frag_0.x[i] = alpha * acc_frag_0.x[i] + beta * c_frag_0.x[i];
@@ -230,27 +238,25 @@ __global__ void wmma_example_mod(half *a, half *b, float *c, int M, int N, int K
 
       for(int i=0; i < 4; i++) {
          if (c_frag_0.x[i] != c_frag_0.x[i + 4]) {
-            printf("0Dif %d frag %2.2f 2frag %2.2f\n", i, c_frag_0.x[i], c_frag_0.x[i + 4]);
+            fault[0] = 1;
+            wmma_diagnosis(b_frag_0, c_frag_diagnosis, M, N, K);
          }
-      }
-
-      for(int i=0; i < 4; i++) {
          if (c_frag_1.x[i] != c_frag_1.x[i + 4]) {
-            printf("1Dif %d frag %2.2f 2frag %2.2f\n", i, c_frag_1.x[i], c_frag_1.x[i + 4]);
+            fault[0] = 1;
+            wmma_diagnosis(b_frag_1, c_frag_diagnosis, M, N, K);
          }
       }
 
-      __syncthreads();
-      
       // Store the output
-
-      for(int i=0; i < 4; i++) {
-         c_frag_0.x[i] = c_frag_1.x[i + 4];
-      }
+      // __syncthreads();
+      // for(int i=0; i < 4; i++) {
+      //    c_frag_0.x[i] = c_frag_1.x[i + 4];
+      // }
 
       wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag_0, ldc, wmma::mem_row_major);
    }
 }
+
 
 __global__ void wmma_safe_mode(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta, int *fault) {
    // Leading dimensions. Packed with no transpositions.
@@ -479,9 +485,9 @@ int main(int argc, char* argv[]) {
    initialize_matrix<float>(b_fp32, MATRIX_K * MATRIX_N, LINEAR);
    print_matrix<float>(b_fp32, MATRIX_K, MATRIX_N);
    
-   printf("a_host\n");
+   //printf("a_host\n");
    initialize_matrix<float>(a_fp32, MATRIX_M * MATRIX_K, ONE);
-   print_matrix<float>(a_fp32, MATRIX_M, MATRIX_K);
+   //print_matrix<float>(a_fp32, MATRIX_M, MATRIX_K);
 
    initialize_matrix<float>(c, MATRIX_M * MATRIX_N, ZERO, true);
 
@@ -513,7 +519,7 @@ int main(int argc, char* argv[]) {
    cudaEventRecord(startWMMA);
    wmma_example <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta);
    printf("Running safe...\n");
-   wmma_safe_mode <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma_safe, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta, fault_device);
+   wmma_fault_tolerant <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma_safe, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta, fault_device);
    cudaEventRecord(stopWMMA);
    cudaEventSynchronize(stopWMMA);
   
