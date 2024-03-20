@@ -27,9 +27,9 @@
 SM_ARCH ?= 70
 
 all: simpleTensorCoreGEMM.cu
-	nvcc -o TCGemm -arch=sm_$(SM_ARCH) -lcublas -lcurand simpleTensorCoreGEMM.cu
+	nvcc -o simpleTensorCoreGEMM -arch=sm_$(SM_ARCH) -lcublas -lcurand simpleTensorCoreGEMM.cu
 
 clean:
-	rm -f TCGemm
+	rm -f simpleTensorCoreGEMM
 
 

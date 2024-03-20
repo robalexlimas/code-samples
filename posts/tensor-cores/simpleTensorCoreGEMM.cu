@@ -114,44 +114,90 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
    }
 }
 
-__device__ void expand_device(half* out, half* in, int rows, int cols, int index, int stride) {
-   // Safe mode
-   for (int row = 0; row < rows; row++)
-   {
-      for (int col = 0; col < WMMA_K / 2; col++)
-      {
-         printf("Index %d row %d col %d\n", index, row, col);
-         out[(row * cols) + col] = in[index + (row * cols) + col];
-         out[(row * cols) + (WMMA_K / 2) + col] = in[index + (row * cols) + col];
-      }
-   }
-}
-
 __device__ void wmma_diagnosis(
+   wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragA,
    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragB,
-   wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float, void> fragC,
+   const float*  fragC,
    int M, int N, int K) {
    int laneid;
+
+   // Declare the fragments
+   wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+   wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+   wmma::fill_fragment(acc_frag, 0.0f);
+
    asm("mov.u32 %0, %laneid;" :"=r"(laneid));
    int bCol = (int)(laneid / 4);
+   int bRow = (int)(laneid % 4);
 
-   __shared__ half bDiagnosis[16][16];
+   __shared__ half diagnosis[256];
+   __shared__ float Cdiagnosis[256];
 
-   for (int i = 0; i < fragB.num_elements / 2; i++)
-   {
-      bDiagnosis[i][bCol] = fragB.x[i];
+   // * fill the b diagnosis within the fragment data
+   for (int i = 0; i < 2; i++) {
+      diagnosis[((bRow * 2) + i) * WMMA_K + bCol] = fragB.x[i];
+      diagnosis[((bRow * 2) + i  + 8) * WMMA_K + bCol] = fragB.x[i + 2];
+
+      diagnosis[((bRow * 2) + i) * WMMA_K + bCol + 8] = fragB.x[i + 4];
+      diagnosis[((bRow * 2) + i  + 8) * WMMA_K + bCol + 8] = fragB.x[i + 6];
    }
 
    __syncthreads();
 
-   for (int i = 0; i < 16; i++) {
-      for (int j = 0; j < 16; j++) {
-         printf("%2.0f ", (float)bDiagnosis[i][j]);
+   // * Copy the columns into the following ones
+   if (bCol < 4) {
+      for (int i = 0; i < 16; i++) {
+         diagnosis[i * WMMA_K + bCol + 4] = diagnosis[i * WMMA_K + bCol];
+         diagnosis[i * WMMA_K + bCol + 12] = diagnosis[i * WMMA_K + bCol + 8];
       }
-      printf("\n\n");
    }
 
    __syncthreads();
+
+   wmma::load_matrix_sync(b_frag, diagnosis, WMMA_K);
+   wmma::mma_sync(acc_frag, fragA, b_frag, acc_frag);
+
+   __syncthreads();
+
+   // if (laneid == 0) {
+   //    acc_frag.x[5] = 10.0f;
+   // }
+   // __syncthreads();
+
+   // ! identification
+   /* todo: copy from c fragment to the shared memory
+   compare
+   -> cols 0-3 with 4-7 difference? means TCU 0 is faulty
+   -> cols 8-11 with 12-15 difference? means TCU 1 is faulty
+   */
+
+   int cRow = (int)(laneid / 4);
+   int cCol = (int)(laneid % 4);
+
+   // * fill the diagnosis within the c fragment data
+   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2)] = acc_frag.x[0];
+   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + 1] = acc_frag.x[1];
+
+   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2)] = acc_frag.x[2];
+   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + 1] = acc_frag.x[3];
+
+   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + 8] = acc_frag.x[4];
+   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + 8 + 1] = acc_frag.x[5];
+
+   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + 8] = acc_frag.x[6];
+   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + 8 + 1] = acc_frag.x[7];
+
+
+   __syncthreads();
+
+   if (laneid == 0) {
+      for (int i = 0; i < 16; i++) {
+         for (int j = 0; j < 16; j++) {
+            printf("shared pos %d row %d col %d %2.2f\n", i * WMMA_K + j, i, j, (float)Cdiagnosis[i * WMMA_K + j]);
+         }
+      }
+   }
+
 
 }
 
@@ -164,8 +210,6 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
    // Tile using a 2D grid
    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
-   int sublaneid;
-   // asm("mov.u32 %0, %laneid;" :"=r"(sublaneid));
  
    // Declare the fragments
    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
@@ -178,6 +222,9 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag_diagnosis;
    wmma::fill_fragment(acc_frag_0, 0.0f);
    wmma::fill_fragment(acc_frag_1, 0.0f);
+
+   int laneid;
+   asm("mov.u32 %0, %laneid;" :"=r"(laneid));
 
    // Loop over k
    for (int i = 0; i < K; i += WMMA_K) {
@@ -194,22 +241,14 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
          wmma::load_matrix_sync(b_frag_0, b + bRow + bCol * ldb, ldb);
          wmma::load_matrix_sync(b_frag_1, b + bRow + bCol * ldb, ldb);
 
-         // // * SAFE MODE TCU 0 <- TCU 1
-         // for(int i=0; i < b_frag_0.num_elements / 4; i++) {
-         //    b_frag_0.x[i] = b_frag_0.x[i + 4];
-         // }
+         // * SAFE MODE TCU 0 <- TCU 1
+         for(int i=0; i < b_frag_0.num_elements / 4; i++) {
+            b_frag_0.x[i] = b_frag_0.x[i + 4];
+         }
 
-         // // * SAFE MODE TCU 1 <- TCU 0
-         // for(int i=0; i < b_frag_1.num_elements / 4; i++) {
-         //    b_frag_1.x[i + 4] = b_frag_1.x[i];
-         // }
-
-         // !emulate a faul inside the TCU 0 on only one column
-         __syncthreads();
-         if (laneid == 0) { // * fault in the column 0
-            for(int i=0; i < 4; i++) {
-                  b_frag_0.x[i] = 0.0f;
-            }
+         // * SAFE MODE TCU 1 <- TCU 0
+         for(int i=0; i < b_frag_1.num_elements / 4; i++) {
+            b_frag_1.x[i + 4] = b_frag_1.x[i];
          }
 
          wmma::mma_sync(acc_frag_0, a_frag, b_frag_0, acc_frag_0);
@@ -236,22 +275,33 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
 
       __syncthreads();
 
+      // !emulate a faul inside the TCU 0 on only one column
+      if (laneid == 0) {
+         c_frag_0.x[1] = 0.0f;
+      }
+
+      __syncthreads();
+
       for(int i=0; i < 4; i++) {
          if (c_frag_0.x[i] != c_frag_0.x[i + 4]) {
             fault[0] = 1;
-            wmma_diagnosis(b_frag_0, c_frag_diagnosis, M, N, K);
          }
          if (c_frag_1.x[i] != c_frag_1.x[i + 4]) {
             fault[0] = 1;
-            wmma_diagnosis(b_frag_1, c_frag_diagnosis, M, N, K);
          }
       }
 
+      __syncthreads();
+
+      if (fault[0] == 1) {
+         wmma_diagnosis(a_frag, b_frag_0, c + cRow + cCol * ldc, M, N, K);
+      }
+
       // Store the output
-      // __syncthreads();
-      // for(int i=0; i < 4; i++) {
-      //    c_frag_0.x[i] = c_frag_1.x[i + 4];
-      // }
+      __syncthreads();
+      for(int i=0; i < 4; i++) {
+         c_frag_0.x[i] = c_frag_1.x[i + 4];
+      }
 
       wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag_0, ldc, wmma::mem_row_major);
    }
@@ -367,6 +417,7 @@ __host__ int get_value(MatrixInitializationType init_type,int randomRange=3,int 
    static int val=0;
    switch(init_type){
       case ZERO:
+         val=0;
          break;
       case ONE:
          val=1;
@@ -485,9 +536,10 @@ int main(int argc, char* argv[]) {
    initialize_matrix<float>(b_fp32, MATRIX_K * MATRIX_N, LINEAR);
    print_matrix<float>(b_fp32, MATRIX_K, MATRIX_N);
    
-   //printf("a_host\n");
-   initialize_matrix<float>(a_fp32, MATRIX_M * MATRIX_K, ONE);
-   //print_matrix<float>(a_fp32, MATRIX_M, MATRIX_K);
+   printf("a_host\n");
+   initialize_matrix<float>(a_fp32, MATRIX_M * MATRIX_K, ZERO);
+   initialize_matrix<float>(a_fp32, MATRIX_M * MATRIX_K, LINEAR);
+   print_matrix<float>(a_fp32, MATRIX_M, MATRIX_K);
 
    initialize_matrix<float>(c, MATRIX_M * MATRIX_N, ZERO, true);
 
