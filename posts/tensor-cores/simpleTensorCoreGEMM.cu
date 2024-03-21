@@ -114,7 +114,7 @@ __global__ void wmma_example(half *a, half *b, float *c, int M, int N, int K, fl
    }
 }
 
-__device__ void wmma_diagnosis(
+__device__ int wmma_diagnosis(
    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragA,
    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragB,
    const float*  fragC,
@@ -159,49 +159,43 @@ __device__ void wmma_diagnosis(
 
    __syncthreads();
 
-   // if (laneid == 0) {
-   //    acc_frag.x[5] = 10.0f;
-   // }
-   // __syncthreads();
+   // * mimic fault in TCU 1
+   if (laneid == 0) {
+      acc_frag.x[5] = 10.0f;
+   }
+   __syncthreads();
 
    // ! identification
-   /* todo: copy from c fragment to the shared memory
-   compare
-   -> cols 0-3 with 4-7 difference? means TCU 0 is faulty
-   -> cols 8-11 with 12-15 difference? means TCU 1 is faulty
-   */
-
    int cRow = (int)(laneid / 4);
    int cCol = (int)(laneid % 4);
 
-   // * fill the diagnosis within the c fragment data
-   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2)] = acc_frag.x[0];
-   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + 1] = acc_frag.x[1];
-
-   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2)] = acc_frag.x[2];
-   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + 1] = acc_frag.x[3];
-
-   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + 8] = acc_frag.x[4];
-   Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + 8 + 1] = acc_frag.x[5];
-
-   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + 8] = acc_frag.x[6];
-   Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + 8 + 1] = acc_frag.x[7];
-
+   // * fill the diagnosis matrix with the c fragment data
+   for (int i = 0; i < 2; i++) {
+      Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + i] = acc_frag.x[i];
+      Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + i] = acc_frag.x[i + 2];
+      Cdiagnosis[((cRow) * WMMA_K) + (cCol * 2) + 8 + i] = acc_frag.x[i + 4];
+      Cdiagnosis[((cRow + 8) * WMMA_K) + (cCol * 2) + 8 + i] = acc_frag.x[i + 6];
+   }
 
    __syncthreads();
 
+   // * diagnosis
    if (laneid == 0) {
       for (int i = 0; i < 16; i++) {
-         for (int j = 0; j < 16; j++) {
-            printf("shared pos %d row %d col %d %2.2f\n", i * WMMA_K + j, i, j, (float)Cdiagnosis[i * WMMA_K + j]);
+         for (int j = 0; j < 4; j++) {
+            if (Cdiagnosis[i * WMMA_K + j] != Cdiagnosis[i * WMMA_K + j + 4]) { // ! faulty TCU0
+               return 0;
+            }
+            if (Cdiagnosis[i * WMMA_K + j + 8] != Cdiagnosis[i * WMMA_K + j + 12]) { // ! faulty TCU1
+               return 1;
+            }
          }
       }
    }
-
-
+   return -1; // ! the fault has not been detected
 }
 
-__global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta, int *fault) {
+__global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta, int *fault, int *tcu) {
    // Leading dimensions. Packed with no transpositions.
    int lda = M;
    int ldb = K;
@@ -219,7 +213,6 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag_1;
    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag_0;
    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag_1;
-   wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag_diagnosis;
    wmma::fill_fragment(acc_frag_0, 0.0f);
    wmma::fill_fragment(acc_frag_1, 0.0f);
 
@@ -263,7 +256,6 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
    if (cRow < M && cCol < N) {
       wmma::load_matrix_sync(c_frag_0, c + cRow + cCol * ldc, ldc, wmma::mem_row_major);
       wmma::load_matrix_sync(c_frag_1, c + cRow + cCol * ldc, ldc, wmma::mem_row_major);
-      wmma::load_matrix_sync(c_frag_diagnosis, c + cRow + cCol * ldc, ldc, wmma::mem_row_major);
 
       for(int i=0; i < c_frag_0.num_elements; i++) {
          c_frag_0.x[i] = alpha * acc_frag_0.x[i] + beta * c_frag_0.x[i];
@@ -275,16 +267,16 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
 
       __syncthreads();
 
-      // !emulate a faul inside the TCU 0 on only one column
+      // !emulate a faul inside the TCU 1 on only one column
       if (laneid == 0) {
-         c_frag_0.x[1] = 0.0f;
+         c_frag_0.x[5] = 0.0f;
       }
 
       __syncthreads();
 
       for(int i=0; i < 4; i++) {
          if (c_frag_0.x[i] != c_frag_0.x[i + 4]) {
-            fault[0] = 1;
+            fault[0] = -1;
          }
          if (c_frag_1.x[i] != c_frag_1.x[i + 4]) {
             fault[0] = 1;
@@ -293,17 +285,31 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
 
       __syncthreads();
 
+      if (fault[0] == -1) {
+         tcu[0] = wmma_diagnosis(a_frag, b_frag_0, c + cRow + cCol * ldc, M, N, K);
+      }
       if (fault[0] == 1) {
-         wmma_diagnosis(a_frag, b_frag_0, c + cRow + cCol * ldc, M, N, K);
+         tcu[0] = wmma_diagnosis(a_frag, b_frag_1, c + cRow + cCol * ldc, M, N, K);
       }
 
       // Store the output
       __syncthreads();
-      for(int i=0; i < 4; i++) {
-         c_frag_0.x[i] = c_frag_1.x[i + 4];
-      }
 
-      wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag_0, ldc, wmma::mem_row_major);
+      if (tcu[0] == 0){
+         // * faulty TCU 0, means consider only the TCU 1 data
+         for(int i=0; i < 4; i++) {
+            c_frag_0.x[i] = c_frag_1.x[i + 4];
+         }
+
+         wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag_0, ldc, wmma::mem_row_major);
+      } else {
+         // * faulty TCU 1, means consider only the TCU 0 data
+         for(int i=0; i < 4; i++) {
+            c_frag_1.x[i + 4] = c_frag_0.x[i];
+         }
+
+         wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag_1, ldc, wmma::mem_row_major);
+      }
    }
 }
 
@@ -502,6 +508,9 @@ int main(int argc, char* argv[]) {
    int *fault;
    int *fault_device;
 
+   int *tcu;
+   int *tcu_device;
+
    printf("Starting...\n");
 
    cudaEvent_t startWMMA;
@@ -515,11 +524,14 @@ int main(int argc, char* argv[]) {
    cudaMalloc((void**)&a_fp32_device, MATRIX_M * MATRIX_K * sizeof(float));
    cudaMalloc((void**)&b_fp32_device, MATRIX_K * MATRIX_N * sizeof(float));
    cudaMalloc((void**)&fault_device, sizeof(int));
+   cudaMalloc((void**)&tcu_device, sizeof(int));
 
    a_fp32 = (float*)malloc(MATRIX_M * MATRIX_K * sizeof(float));
    b_fp32 = (float*)malloc(MATRIX_K * MATRIX_N * sizeof(float));
    fault = (int*)malloc(sizeof(int));
    fault[0] = 0;
+   tcu = (int*)malloc(sizeof(int));
+   tcu[0] = -1;
 
    c = (float*)malloc(MATRIX_M * MATRIX_N * sizeof(float));
    c_host_wmma = (float*)malloc(MATRIX_M * MATRIX_N * sizeof(float));
@@ -571,7 +583,7 @@ int main(int argc, char* argv[]) {
    cudaEventRecord(startWMMA);
    wmma_example <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta);
    printf("Running safe...\n");
-   wmma_fault_tolerant <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma_safe, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta, fault_device);
+   wmma_fault_tolerant <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma_safe, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta, fault_device, tcu_device);
    cudaEventRecord(stopWMMA);
    cudaEventSynchronize(stopWMMA);
   
@@ -579,6 +591,7 @@ int main(int argc, char* argv[]) {
    cudaMemcpy(c_host_wmma, c_wmma, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
    cudaMemcpy(c_host_wmma_safe, c_wmma_safe, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost);
    cudaMemcpy(fault, fault_device, sizeof(int), cudaMemcpyDeviceToHost);
+   cudaMemcpy(tcu, tcu_device, sizeof(int), cudaMemcpyDeviceToHost);
 
    printf("c_result\n");
    print_matrix<float>(c_host_wmma, MATRIX_M, MATRIX_N);
@@ -586,7 +599,9 @@ int main(int argc, char* argv[]) {
    printf("\nc_result secondary\n");
    print_matrix<float>(c_host_wmma_safe, MATRIX_M, MATRIX_N);
 
-   printf("Fault detected %d\n", fault[0]);
+   if (fault[0] != 0) {
+      printf("Fault detected in TCU%d\n", tcu[0]);
+   }
  
    float wmmaTime;
    cudaEventElapsedTime(&wmmaTime, startWMMA, stopWMMA);
