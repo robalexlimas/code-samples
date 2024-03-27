@@ -159,11 +159,11 @@ __device__ int wmma_diagnosis(
 
    __syncthreads();
 
-   // * mimic fault in TCU 1
-   if (laneid == 0) {
-      acc_frag.x[5] = 10.0f;
-   }
-   __syncthreads();
+   // // * mimic fault in TCU 1
+   // if (laneid == 0) {
+   //    acc_frag.x[5] = 10.0f;
+   // }
+   // __syncthreads();
 
    // ! identification
    int cRow = (int)(laneid / 4);
@@ -216,9 +216,6 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
    wmma::fill_fragment(acc_frag_0, 0.0f);
    wmma::fill_fragment(acc_frag_1, 0.0f);
 
-   int laneid;
-   asm("mov.u32 %0, %laneid;" :"=r"(laneid));
-
    // Loop over k
    for (int i = 0; i < K; i += WMMA_K) {
       int aRow = warpM * WMMA_M;
@@ -267,12 +264,12 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
 
       __syncthreads();
 
-      // !emulate a faul inside the TCU 1 on only one column
-      if (laneid == 0) {
-         c_frag_0.x[5] = 0.0f;
-      }
+      // // !emulate a faul inside the TCU 1 on only one column
+      // if (laneid == 0) {
+      //    c_frag_0.x[5] = 0.0f;
+      // }
 
-      __syncthreads();
+      // __syncthreads();
 
       for(int i=0; i < 4; i++) {
          if (c_frag_0.x[i] != c_frag_0.x[i + 4]) {
@@ -312,7 +309,6 @@ __global__ void wmma_fault_tolerant(half *a, half *b, float *c, int M, int N, in
       }
    }
 }
-
 
 __global__ void wmma_safe_mode(half *a, half *b, float *c, int M, int N, int K, float alpha, float beta, int *fault) {
    // Leading dimensions. Packed with no transpositions.
@@ -581,9 +577,15 @@ int main(int argc, char* argv[]) {
    
    printf("Running with wmma...\n");
    cudaEventRecord(startWMMA);
+
    wmma_example <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta);
-   printf("Running safe...\n");
+   printf("Running tolerant...\n");
+
    wmma_fault_tolerant <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma_safe, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta, fault_device, tcu_device);
+   
+   printf("Running safe...\n");
+   wmma_safe_mode <<< gridDim, blockDim >>> (a_fp16, b_fp16, c_wmma_safe, MATRIX_M, MATRIX_N, MATRIX_K, alpha, beta, fault_device);
+
    cudaEventRecord(stopWMMA);
    cudaEventSynchronize(stopWMMA);
   
