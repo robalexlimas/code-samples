@@ -3,7 +3,7 @@
 #include <mma.h>
 
 #define WMMA_TILE   16  // WMMA supports 16x16 tiles
-#define TILE_BLOCKS 2   // How many tiles are loaded inside the shared memory
+#define TILE_BLOCKS 8   // How many tiles are loaded inside the shared memory
 
 using namespace nvcuda;
 
@@ -34,114 +34,93 @@ __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, in
 
     wmma::fill_fragment(acc_frag, 0.0f);
 
-if (tileRow == 0 && tileCol == 0) {
-// * validate that the indices are inside the matrices
-// if (tileRow < M && tileCol < N) {
+    // if (tileRow == 0 && tileCol == 0) {
+    // * validate that the indices are inside the matrices
+    if (tileRow < M && tileCol < N) {
 
-    // * tile at the device level
-    for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
+        // * tile at the device level
+        for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
 
-        // * tile at the warp level
-        for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
-            // * these values can get values between 0 - TILE_BLOCK * WMMA_TILE
-            // * e.g., when TILE_BLOCK is equal to 2, these values can get 0 to 31
+            // * tile at the warp level for loading shared memory
+            for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
+                // * these values can get values between 0 - TILE_BLOCK * WMMA_TILE
+                // * e.g., when TILE_BLOCK is equal to 2, these values can get 0 to 31
 
-            // * Compute the indices for loading the data inside the shared memories
-            int sharedAxId = threadIdx.x * TILE_BLOCKS * WMMA_TILE;
-            int sharedAyId = threadIdx.y + wmmaTile;
-            int sharedAId = sharedAxId + sharedAyId;
+                // * Compute the indices for loading the data inside the shared memories
+                int sharedAxId = threadIdx.x * TILE_BLOCKS * WMMA_TILE;
+                int sharedAyId = threadIdx.y + wmmaTile;
+                int sharedAId = sharedAxId + sharedAyId;
 
-            int sharedBxId = (threadIdx.x + wmmaTile) * WMMA_TILE;
-            int sharedById = threadIdx.y;
-            int sharedBId = sharedBxId + sharedById;
+                int sharedBxId = (threadIdx.x + wmmaTile) * WMMA_TILE;
+                int sharedById = threadIdx.y;
+                int sharedBId = sharedBxId + sharedById;
 
-            // * Compute the indices for reading the data from the global memory
-            int globalAx = (tileRow + threadIdx.x) * N;
-            int globalAy = sharedTile + wmmaTile + threadIdx.y;
-            int globalA = globalAx + globalAy;
+                // * Compute the indices for reading the data from the global memory
+                int globalAx = (tileRow + threadIdx.x) * N;
+                int globalAy = sharedTile + wmmaTile + threadIdx.y;
+                int globalA = globalAx + globalAy;
 
-            int globalBx = (threadIdx.x + sharedTile + wmmaTile) * N;
-            int globalBy = tileCol + threadIdx.y;
-            int globalB = globalBx + globalBy;
+                int globalBx = (threadIdx.x + sharedTile + wmmaTile) * N;
+                int globalBy = tileCol + threadIdx.y;
+                int globalB = globalBx + globalBy;
 
-            // * Load the input values from global memory to shared memory
-            sharedA[sharedAId] = A[globalA];
-            sharedB[sharedBId] = B[globalB];
+                // * Load the input values from global memory to shared memory
+                sharedA[sharedAId] = A[globalA];
+                sharedB[sharedBId] = B[globalB];
 
-            // * Since C must be only loaded once
-            if (sharedTile == 0 && wmmaTile == 0) {
+                // * Since C must be only loaded once
+                if (sharedTile == 0 && wmmaTile == 0) {
+                    int sharedCxId = threadIdx.x * WMMA_TILE;
+                    int sharedCyId = threadIdx.y;
+                    int sharedCId = sharedCxId + sharedCyId;
 
-                int sharedCxId = threadIdx.x * WMMA_TILE;
-                int sharedCyId = threadIdx.y;
-                int sharedCId = sharedCxId + sharedCyId;
+                    int globalCx = (tileRow + threadIdx.x) * N;
+                    int globalCy = tileCol + threadIdx.y;
+                    int globalC = globalCx + globalCy;
 
-                int globalCx = (tileRow + threadIdx.x) * N;
-                int globalCy = tileCol + threadIdx.y;
-                int globalC = globalCx + globalCy;
-
-                sharedC[sharedCId] = C[globalC];
+                    sharedC[sharedCId] = C[globalC];
+                }
             }
+
+            __syncthreads();
+
+            // * tile at the warp level for performing matrix multiplciation A * B for each segment
+            for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
+                wmma::load_matrix_sync(a_frag, sharedA + wmmaTile, WMMA_TILE);
+                wmma::load_matrix_sync(b_frag, sharedB + wmmaTile, WMMA_TILE);
+
+                wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+
+        }
+        // * add the C segment
+        wmma::load_matrix_sync(c_frag, sharedC, WMMA_TILE, wmma::mem_row_major);
+
+#pragma unroll
+        for(int i=0; i < c_frag.num_elements; i++) {
+            c_frag.x[i] = acc_frag.x[i] + c_frag.x[i];
         }
 
         __syncthreads();
+
+        // * store the output segment from the fragment into the shared memory
+        wmma::store_matrix_sync(sharedC, c_frag, WMMA_TILE, wmma::mem_row_major);
+
+        int globalCxStore = (tileRow + threadIdx.x) * N;
+        int globalCyStore = tileCol + threadIdx.y;
+        int globalCStore = globalCxStore + globalCyStore;
+
+        int cxStore = threadIdx.x * WMMA_TILE;
+        int cyStore = threadIdx.y;
+        int cStore = cxStore + cyStore;
+
+        D[globalCStore] = sharedC[cStore];
     }
 }
 
-    // for (int tileIdx = 0; tileIdx < (N + (TILE_BLOCKS * WMMA_TILE) - 1) / (TILE_BLOCKS * WMMA_TILE); ++tileIdx) {
-    //     int tiledRow = tileRow + threadIdx.y;
-    //     int tiledCol = tileCol + threadIdx.x;
-
-        // if (tiledRow < N && tileIdx * (TILE_BLOCKS * WMMA_TILE) + threadIdx.x < N) {
-        //     sharedA[threadIdx.y * (TILE_BLOCKS * WMMA_TILE) + threadIdx.x] = A[tiledRow * N + tileIdx * (TILE_BLOCKS * WMMA_TILE) + threadIdx.x];
-        // } else {
-        //     sharedA[threadIdx.y * (TILE_BLOCKS * WMMA_TILE) + threadIdx.x] = __float2half(0.0f);
-        // }
-
-    //     if (tiledCol < N && tileIdx * (TILE_BLOCKS * WMMA_TILE) + threadIdx.y < N) {
-    //         sharedB[threadIdx.y * (TILE_BLOCKS * WMMA_TILE) + threadIdx.x] = B[(tileIdx * (TILE_BLOCKS * WMMA_TILE) + threadIdx.y) * N + tiledCol];
-    //     } else {
-    //         sharedB[threadIdx.y * (TILE_BLOCKS * WMMA_TILE) + threadIdx.x] = __float2half(0.0f);
-    //     }
-
-    //     if (tileIdx == 0 && tiledRow < N && tiledCol < N) {
-    //         sharedC[threadIdx.y * WMMA_TILE + threadIdx.x] = C[tiledRow * N + tiledCol];
-    //     } else {
-    //         sharedC[threadIdx.y * WMMA_TILE + threadIdx.x] = 0.0f;
-    //     }
-
-        
-
-    //     for (int subTileIdx = 0; subTileIdx < TILE_BLOCKS; ++subTileIdx) {
-    //         wmma::load_matrix_sync(a_frag, sharedA + subTileIdx * WMMA_TILE, WMMA_TILE);
-    //         wmma::load_matrix_sync(b_frag, sharedB + subTileIdx * WMMA_TILE, WMMA_TILE);
-    //         wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-
-    //         for (int i = 0; i < a_frag.num_elements; i++) {
-    //             printf("a_frag[%d]: %2.f\n", i, __half2float(a_frag.x[i]));
-    //         }
-
-    //         __syncthreads();
-    //     }
-
-    //     __syncthreads();
-    // }
-
-    // if (row < N && col < N) {
-    //     wmma::load_matrix_sync(c_frag, sharedC, WMMA_TILE, wmma::mem_row_major);
-
-    //     for (int i = 0; i < c_frag.num_elements; i++) {
-    //         c_frag.x[i] = acc_frag.x[i] + c_frag.x[i];
-    //     }
-
-    //     wmma::store_matrix_sync(sharedC, c_frag, WMMA_TILE, wmma::mem_row_major);
-
-    //     D[row * N + col] = sharedC[threadIdx.y * WMMA_TILE + threadIdx.x];
-    // }
-}
-
 int main() {
-    int N = 64;
-    int M = 64;
+    int N = 128;
+    int M = 128;
     size_t half_bytes = N * M * sizeof(half);
     size_t float_bytes = N * M * sizeof(float);
 
@@ -151,9 +130,9 @@ int main() {
     float* h_D = (float*)malloc(float_bytes);
 
     for (int i = 0; i < N * M; i++) {
-        h_A[i] = __float2half(static_cast<float>(i));
-        h_B[i] = __float2half(static_cast<float>(i));
-        h_C[i] = static_cast<float>(i);
+        h_A[i] = __float2half(static_cast<float>(1));
+        h_B[i] = __float2half(static_cast<float>(1));
+        h_C[i] = static_cast<float>(1);
     }
 
     half* d_A, * d_B;
