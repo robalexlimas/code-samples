@@ -3,7 +3,7 @@
 #include <mma.h>
 
 #define WMMA_TILE   16  // WMMA supports 16x16 tiles
-#define TILE_BLOCKS 8   // How many tiles are loaded inside the shared memory
+#define TILE_BLOCKS 2   // How many tiles are loaded inside the shared memory
 
 using namespace nvcuda;
 
@@ -16,6 +16,61 @@ void printMatrix(T* matrix, int N, int M) {
         printf("\n");
     }
     printf("\n");
+}
+
+__device__ void loadSharedMemory(half* A, half* B, float* C, half* sharedA, half* sharedB, float* sharedC, int N, int M, int tileRow, int tileCol, int sharedTile) {
+    // * tile at the warp level for loading shared memory
+    for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
+        // * these values can get values between 0 - TILE_BLOCK * WMMA_TILE
+        // * e.g., when TILE_BLOCK is equal to 2, these values can get 0 to 31
+
+        // * Compute the indices for loading the data inside the shared memories
+        int sharedAxId = threadIdx.x * TILE_BLOCKS * WMMA_TILE;
+        int sharedAyId = threadIdx.y + wmmaTile;
+        int sharedAId = sharedAxId + sharedAyId;
+
+        int sharedBxId = (threadIdx.x + wmmaTile) * WMMA_TILE;
+        int sharedById = threadIdx.y;
+        int sharedBId = sharedBxId + sharedById;
+
+        // * Compute the indices for reading the data from the global memory
+        int globalAx = (tileRow + threadIdx.x) * N;
+        int globalAy = sharedTile + wmmaTile + threadIdx.y;
+        int globalA = globalAx + globalAy;
+
+        int globalBx = (threadIdx.x + sharedTile + wmmaTile) * N;
+        int globalBy = tileCol + threadIdx.y;
+        int globalB = globalBx + globalBy;
+
+        // * Load the input values from global memory to shared memory
+        sharedA[sharedAId] = A[globalA];
+        sharedB[sharedBId] = B[globalB];
+
+        // * Since C must be only loaded once
+        if (sharedTile == 0 && wmmaTile == 0) {
+            int sharedCxId = threadIdx.x * WMMA_TILE;
+            int sharedCyId = threadIdx.y;
+            int sharedCId = sharedCxId + sharedCyId;
+
+            int globalCx = (tileRow + threadIdx.x) * N;
+            int globalCy = tileCol + threadIdx.y;
+            int globalC = globalCx + globalCy;
+
+            sharedC[sharedCId] = C[globalC];
+        }
+    }
+}
+
+__device__ void storeGlobalMemory(float* D, float* sharedC, int N, int tileRow, int tileCol) {
+    int globalCxStore = (tileRow + threadIdx.x) * N;
+    int globalCyStore = tileCol + threadIdx.y;
+    int globalCStore = globalCxStore + globalCyStore;
+
+    int cxStore = threadIdx.x * WMMA_TILE;
+    int cyStore = threadIdx.y;
+    int cStore = cxStore + cyStore;
+
+    D[globalCStore] = sharedC[cStore];
 }
 
 __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, int M) {
@@ -41,46 +96,7 @@ __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, in
         // * tile at the device level
         for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
 
-            // * tile at the warp level for loading shared memory
-            for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
-                // * these values can get values between 0 - TILE_BLOCK * WMMA_TILE
-                // * e.g., when TILE_BLOCK is equal to 2, these values can get 0 to 31
-
-                // * Compute the indices for loading the data inside the shared memories
-                int sharedAxId = threadIdx.x * TILE_BLOCKS * WMMA_TILE;
-                int sharedAyId = threadIdx.y + wmmaTile;
-                int sharedAId = sharedAxId + sharedAyId;
-
-                int sharedBxId = (threadIdx.x + wmmaTile) * WMMA_TILE;
-                int sharedById = threadIdx.y;
-                int sharedBId = sharedBxId + sharedById;
-
-                // * Compute the indices for reading the data from the global memory
-                int globalAx = (tileRow + threadIdx.x) * N;
-                int globalAy = sharedTile + wmmaTile + threadIdx.y;
-                int globalA = globalAx + globalAy;
-
-                int globalBx = (threadIdx.x + sharedTile + wmmaTile) * N;
-                int globalBy = tileCol + threadIdx.y;
-                int globalB = globalBx + globalBy;
-
-                // * Load the input values from global memory to shared memory
-                sharedA[sharedAId] = A[globalA];
-                sharedB[sharedBId] = B[globalB];
-
-                // * Since C must be only loaded once
-                if (sharedTile == 0 && wmmaTile == 0) {
-                    int sharedCxId = threadIdx.x * WMMA_TILE;
-                    int sharedCyId = threadIdx.y;
-                    int sharedCId = sharedCxId + sharedCyId;
-
-                    int globalCx = (tileRow + threadIdx.x) * N;
-                    int globalCy = tileCol + threadIdx.y;
-                    int globalC = globalCx + globalCy;
-
-                    sharedC[sharedCId] = C[globalC];
-                }
-            }
+            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile);
 
             __syncthreads();
 
@@ -106,21 +122,13 @@ __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, in
         // * store the output segment from the fragment into the shared memory
         wmma::store_matrix_sync(sharedC, c_frag, WMMA_TILE, wmma::mem_row_major);
 
-        int globalCxStore = (tileRow + threadIdx.x) * N;
-        int globalCyStore = tileCol + threadIdx.y;
-        int globalCStore = globalCxStore + globalCyStore;
-
-        int cxStore = threadIdx.x * WMMA_TILE;
-        int cyStore = threadIdx.y;
-        int cStore = cxStore + cyStore;
-
-        D[globalCStore] = sharedC[cStore];
+        storeGlobalMemory(D, sharedC, N, tileRow, tileCol);
     }
 }
 
 int main() {
-    int N = 128;
-    int M = 128;
+    int N = 64;
+    int M = 64;
     size_t half_bytes = N * M * sizeof(half);
     size_t float_bytes = N * M * sizeof(float);
 
