@@ -73,6 +73,105 @@ __device__ void storeGlobalMemory(float* D, float* sharedC, int N, int tileRow, 
     D[globalCStore] = sharedC[cStore];
 }
 
+__device__ void updateBFrag(
+    wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> b_frag_0, 
+    wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> b_frag_1) {
+        // * SAFE MODE TCU 0 <- TCU 1
+        for(int i=0; i < b_frag_0.num_elements / 4; i++) {
+            b_frag_0.x[i] = b_frag_0.x[i + 4];
+        }
+
+        // * SAFE MODE TCU 1 <- TCU 0
+        for(int i=0; i < b_frag_1.num_elements / 4; i++) {
+            b_frag_1.x[i + 4] = b_frag_1.x[i];
+        }
+}
+
+__device__ void checkCFrag(
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> c_frag_0, 
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> c_frag_1,
+    int *fault) {
+        for(int i=0; i < 4; i++) {
+            if (c_frag_0.x[i] != c_frag_0.x[i + 4]) {
+                printf("Something happened frag0!!!\n");
+                fault[0] = -1;
+            }
+            if (c_frag_1.x[i] != c_frag_1.x[i + 4]) {
+                printf("Something happened frag1!!!\n");
+                fault[0] = 1;
+            }
+        }
+}
+
+__global__ void matrixMulAddWMMASafe(half* A, half* B, float* C, float* D, int N, int M, int *fault) {
+    extern __shared__ half sharedMem[];
+    half* sharedA = sharedMem;
+    half* sharedB = sharedMem + TILE_BLOCKS * WMMA_TILE * WMMA_TILE;
+    float* sharedC = (float*)(sharedMem + 2 * TILE_BLOCKS * WMMA_TILE * WMMA_TILE);
+
+    int tileRow = blockIdx.y * WMMA_TILE;
+    int tileCol = blockIdx.x * WMMA_TILE;
+
+    wmma::fragment<wmma::matrix_a, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> a_frag;
+
+    wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> b_frag_0; 
+    wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> b_frag_1;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> acc_frag_0;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> acc_frag_1;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> c_frag_0;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> c_frag_1;
+
+    wmma::fill_fragment(acc_frag_0, 0.0f);
+    wmma::fill_fragment(acc_frag_1, 0.0f);
+
+    // if (tileRow == 0 && tileCol == 0) {
+    // * validate that the indices are inside the matrices
+    if (tileRow < M && tileCol < N) {
+
+        // * tile at the device level
+        for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
+
+            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile);
+
+            __syncthreads();
+
+            // * tile at the warp level for performing matrix multiplciation A * B for each segment
+            for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
+                wmma::load_matrix_sync(a_frag, sharedA + wmmaTile, WMMA_TILE);
+
+                wmma::load_matrix_sync(b_frag_0, sharedB, WMMA_TILE);
+                wmma::load_matrix_sync(b_frag_1, sharedB, WMMA_TILE);
+
+                updateBFrag(b_frag_0, b_frag_1);
+
+                wmma::mma_sync(acc_frag_0, a_frag, b_frag_0, acc_frag_0);
+                wmma::mma_sync(acc_frag_1, a_frag, b_frag_1, acc_frag_1);
+            }
+        }
+        // * add the C segment
+        wmma::load_matrix_sync(c_frag_0, sharedC, WMMA_TILE, wmma::mem_row_major);
+        wmma::load_matrix_sync(c_frag_1, sharedC, WMMA_TILE, wmma::mem_row_major);
+
+#pragma unroll
+        for(int i=0; i < c_frag_0.num_elements; i++) {
+            c_frag_0.x[i] = acc_frag_0.x[i] + c_frag_0.x[i];
+        }
+#pragma unroll
+        for(int i=0; i < c_frag_1.num_elements; i++) {
+            c_frag_1.x[i] = acc_frag_1.x[i] + c_frag_1.x[i];
+        }
+
+        __syncthreads();
+
+        checkCFrag(c_frag_0, c_frag_1, fault);
+
+        // * store the output segment from the fragment into the shared memory
+        wmma::store_matrix_sync(sharedC, c_frag_0, WMMA_TILE, wmma::mem_row_major);
+
+        storeGlobalMemory(D, sharedC, N, tileRow, tileCol);
+    }
+}
+
 __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, int M) {
     extern __shared__ half sharedMem[];
     half* sharedA = sharedMem;
@@ -127,10 +226,17 @@ __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, in
 }
 
 int main() {
-    int N = 64;
-    int M = 64;
+    int N = 32;
+    int M = 32;
     size_t half_bytes = N * M * sizeof(half);
     size_t float_bytes = N * M * sizeof(float);
+
+    int *fault;
+    int *fault_device;
+
+    fault = (int*)malloc(sizeof(int));
+    fault[0] = 0;
+    cudaMalloc((void**)&fault_device, sizeof(int));
 
     half* h_A = (half*)malloc(half_bytes);
     half* h_B = (half*)malloc(half_bytes);
@@ -158,9 +264,16 @@ int main() {
     dim3 gridDim(N / WMMA_TILE, M / WMMA_TILE);
 
     size_t sharedMemSize = 2 * TILE_BLOCKS * WMMA_TILE * WMMA_TILE * sizeof(half) + WMMA_TILE * WMMA_TILE * sizeof(float);
-    matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M);
+    matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device);
+    // matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M);
 
     cudaMemcpy(h_D, d_D, float_bytes, cudaMemcpyDeviceToHost);
+
+    cudaMemcpy(fault, fault_device, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (fault[0] != 0) {
+      printf("Fault detected\n");
+   }
 
     std::cout << "Matrix A:" << std::endl;
     printMatrix(h_A, N, M);
