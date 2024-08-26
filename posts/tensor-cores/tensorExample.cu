@@ -103,6 +103,174 @@ __device__ void checkCFrag(
         }
 }
 
+__device__ int wmma_diagnosis(
+   wmma::fragment<wmma::matrix_a, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> fragA,
+   wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> fragB,
+   const float*  fragC,
+   int N, int M) {
+
+    int laneid;
+    asm("mov.u32 %0, %laneid;" :"=r"(laneid));
+    int bCol = (int)(laneid / 4);
+    int bRow = (int)(laneid % 4);
+
+    // Declare the fragments
+    wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> acc_frag;
+    wmma::fill_fragment(acc_frag, 0.0f);
+
+    __shared__ half diagnosis[256];
+    __shared__ float Cdiagnosis[256];
+
+    // * fill the b diagnosis within the fragment data
+    for (int i = 0; i < 2; i++) {
+        diagnosis[((bRow * 2) + i) * WMMA_TILE + bCol] = fragB.x[i];
+        diagnosis[((bRow * 2) + i  + 8) * WMMA_TILE + bCol] = fragB.x[i + 2];
+
+        diagnosis[((bRow * 2) + i) * WMMA_TILE + bCol + 8] = fragB.x[i + 4];
+        diagnosis[((bRow * 2) + i  + 8) * WMMA_TILE + bCol + 8] = fragB.x[i + 6];
+    }
+
+    __syncthreads();
+
+    // * Copy the columns into the following ones
+    if (bCol < 4) {
+        for (int i = 0; i < 16; i++) {
+            diagnosis[i * WMMA_TILE + bCol + 4] = diagnosis[i * WMMA_TILE + bCol];
+            diagnosis[i * WMMA_TILE + bCol + 12] = diagnosis[i * WMMA_TILE + bCol + 8];
+        }
+    }
+
+    wmma::load_matrix_sync(b_frag, diagnosis, WMMA_TILE);
+    wmma::mma_sync(acc_frag, fragA, b_frag, acc_frag);
+
+    __syncthreads();
+
+    // * identification
+    int cRow = (int)(laneid / 4);
+    int cCol = (int)(laneid % 4);
+
+    // * fill the diagnosis matrix with the c fragment data
+    for (int i = 0; i < 2; i++) {
+        Cdiagnosis[((cRow) * WMMA_TILE) + (cCol * 2) + i] = acc_frag.x[i];
+        Cdiagnosis[((cRow + 8) * WMMA_TILE) + (cCol * 2) + i] = acc_frag.x[i + 2];
+        Cdiagnosis[((cRow) * WMMA_TILE) + (cCol * 2) + 8 + i] = acc_frag.x[i + 4];
+        Cdiagnosis[((cRow + 8) * WMMA_TILE) + (cCol * 2) + 8 + i] = acc_frag.x[i + 6];
+    }
+
+    __syncthreads();
+
+    // * diagnosis
+    if (laneid == 0) {
+        for (int i = 0; i < 16; i++) {
+            for (int j = 0; j < 4; j++) {
+                if (Cdiagnosis[i * WMMA_TILE + j] != Cdiagnosis[i * WMMA_TILE + j + 4]) {
+                    // * faulty TCU0
+                    return 0;
+                }
+                if (Cdiagnosis[i * WMMA_TILE + j + 8] != Cdiagnosis[i * WMMA_TILE + j + 12]) { 
+                    // * faulty TCU1
+                    return 1;
+                }
+            }
+        }
+    }
+    // * the fault has not been detected
+    return -1;
+}
+
+
+__global__ void matrixMulAddWMMATolerant(half* A, half* B, float* C, float* D, int N, int M, int *fault, int* tcu) {
+    extern __shared__ half sharedMem[];
+    half* sharedA = sharedMem;
+    half* sharedB = sharedMem + TILE_BLOCKS * WMMA_TILE * WMMA_TILE;
+    float* sharedC = (float*)(sharedMem + 2 * TILE_BLOCKS * WMMA_TILE * WMMA_TILE);
+
+    int tileRow = blockIdx.y * WMMA_TILE;
+    int tileCol = blockIdx.x * WMMA_TILE;
+
+    wmma::fragment<wmma::matrix_a, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> a_frag;
+
+    wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> b_frag_0; 
+    wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE, half, wmma::row_major> b_frag_1;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> acc_frag_0;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> acc_frag_1;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> c_frag_0;
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> c_frag_1;
+
+    wmma::fill_fragment(acc_frag_0, 0.0f);
+    wmma::fill_fragment(acc_frag_1, 0.0f);
+
+    // if (tileRow == 0 && tileCol == 0) {
+    // * validate that the indices are inside the matrices
+    if (tileRow < M && tileCol < N) {
+
+        // * tile at the device level
+        for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
+
+            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile);
+
+            __syncthreads();
+
+            // * tile at the warp level for performing matrix multiplciation A * B for each segment
+            for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
+                wmma::load_matrix_sync(a_frag, sharedA + wmmaTile, WMMA_TILE);
+
+                wmma::load_matrix_sync(b_frag_0, sharedB, WMMA_TILE);
+                wmma::load_matrix_sync(b_frag_1, sharedB, WMMA_TILE);
+
+                updateBFrag(b_frag_0, b_frag_1);
+
+                wmma::mma_sync(acc_frag_0, a_frag, b_frag_0, acc_frag_0);
+                wmma::mma_sync(acc_frag_1, a_frag, b_frag_1, acc_frag_1);
+            }
+        }
+        // * add the C segment
+        wmma::load_matrix_sync(c_frag_0, sharedC, WMMA_TILE, wmma::mem_row_major);
+        wmma::load_matrix_sync(c_frag_1, sharedC, WMMA_TILE, wmma::mem_row_major);
+
+#pragma unroll
+        for(int i=0; i < c_frag_0.num_elements; i++) {
+            c_frag_0.x[i] = acc_frag_0.x[i] + c_frag_0.x[i];
+        }
+#pragma unroll
+        for(int i=0; i < c_frag_1.num_elements; i++) {
+            c_frag_1.x[i] = acc_frag_1.x[i] + c_frag_1.x[i];
+        }
+
+        __syncthreads();
+
+        checkCFrag(c_frag_0, c_frag_1, fault);
+
+        __syncthreads();
+
+        if (fault[0] == -1) {
+            tcu[0] = wmma_diagnosis(a_frag, b_frag_0, sharedC, N, M);
+        } else if  (fault[0] == 1) {
+            tcu[0] = wmma_diagnosis(a_frag, b_frag_1, sharedC, N, M);
+        }
+
+        // * store the output segment from the fragment into the shared memory
+        __syncthreads();
+
+        if (tcu[0] == 0){
+            // * faulty TCU 0, means consider only the TCU 1 data
+            for(int i=0; i < 4; i++) {
+                c_frag_0.x[i] = c_frag_1.x[i + 4];
+            }
+            wmma::store_matrix_sync(sharedC, c_frag_0, WMMA_TILE, wmma::mem_row_major);
+        } else {
+            // * faulty TCU 1, means consider only the TCU 0 data
+            for(int i=0; i < 4; i++) {
+                c_frag_1.x[i + 4] = c_frag_0.x[i];
+            }
+            wmma::store_matrix_sync(sharedC, c_frag_1, WMMA_TILE, wmma::mem_row_major);
+        }
+
+        storeGlobalMemory(D, sharedC, N, tileRow, tileCol);
+    }
+}
+
 __global__ void matrixMulAddWMMASafe(half* A, half* B, float* C, float* D, int N, int M, int *fault) {
     extern __shared__ half sharedMem[];
     half* sharedA = sharedMem;
@@ -234,9 +402,16 @@ int main() {
     int *fault;
     int *fault_device;
 
+    int *tcu;
+    int *tcu_device;
+
     fault = (int*)malloc(sizeof(int));
     fault[0] = 0;
     cudaMalloc((void**)&fault_device, sizeof(int));
+
+    tcu = (int*)malloc(sizeof(int));
+    tcu[0] = -1;
+    cudaMalloc((void**)&tcu_device, sizeof(int));
 
     half* h_A = (half*)malloc(half_bytes);
     half* h_B = (half*)malloc(half_bytes);
@@ -264,15 +439,17 @@ int main() {
     dim3 gridDim(N / WMMA_TILE, M / WMMA_TILE);
 
     size_t sharedMemSize = 2 * TILE_BLOCKS * WMMA_TILE * WMMA_TILE * sizeof(half) + WMMA_TILE * WMMA_TILE * sizeof(float);
-    matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device);
+    // matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device);
+    matrixMulAddWMMATolerant<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, tcu_device);
     // matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M);
 
     cudaMemcpy(h_D, d_D, float_bytes, cudaMemcpyDeviceToHost);
 
     cudaMemcpy(fault, fault_device, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(tcu, tcu_device, sizeof(int), cudaMemcpyDeviceToHost);
 
     if (fault[0] != 0) {
-      printf("Fault detected\n");
+      printf("Fault detected at the TCU %d\n", tcu[0]);
    }
 
     std::cout << "Matrix A:" << std::endl;
