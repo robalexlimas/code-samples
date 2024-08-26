@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <string>
 
 #define WMMA_TILE   16  // WMMA supports 16x16 tiles
 // #define DEBUG 0
@@ -425,13 +426,16 @@ float measureKernelTime(Func kernel) {
 
 void printfStatistics(int method, int N, float timeMs, int sharedMemory) {
     // * Calculate TFLOPs
-    double flops = 2.0 * N * N * N;
+    double flops = 2.0 * N * N * N + N * N;
     double elapsedTimeInSeconds = timeMs / 1000.0;
     double tflops = flops / (elapsedTimeInSeconds * 1e12);
 
     // * method, size, time, shared, flops, tflops
     // * method 0 - normal, 1 - detection, 2 - correction
-    printf("%d,%d,%2.4f,%d,%2.4f,%2.4f\n", method, N, timeMs, sharedMemory, flops, tflops);
+    if (method == 0) printf("normal,%d,%2.4f,%d,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops);
+    if (method == 1) printf("detection,%d,%2.4f,%d,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops);
+    if (method == 2) printf("correction,%d,%2.4f,%d,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops);
+    
 }
 
 int main(int argc, char* argv[]) {
