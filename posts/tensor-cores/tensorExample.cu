@@ -3,7 +3,7 @@
 #include <mma.h>
 
 #define WMMA_TILE   16  // WMMA supports 16x16 tiles
-#define TILE_BLOCKS 2   // How many tiles are loaded inside the shared memory
+#define TILE_BLOCKS 32   // How many tiles are loaded inside the shared memory
 
 using namespace nvcuda;
 
@@ -393,9 +393,16 @@ __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, in
     }
 }
 
-int main() {
-    int N = 32;
-    int M = 32;
+int main(int argc, char* argv[]) {
+    // * Must be multiples of 16 for wmma code to work
+    if (argv[1] == "") {
+        printf("Matrix size must be initialized, and it must be multiples of 16");
+        return 0;
+    }
+
+    const int M = atoi(argv[1]);
+    const int N = atoi(argv[1]);
+
     size_t half_bytes = N * M * sizeof(half);
     size_t float_bytes = N * M * sizeof(float);
 
@@ -439,9 +446,12 @@ int main() {
     dim3 gridDim(N / WMMA_TILE, M / WMMA_TILE);
 
     size_t sharedMemSize = 2 * TILE_BLOCKS * WMMA_TILE * WMMA_TILE * sizeof(half) + WMMA_TILE * WMMA_TILE * sizeof(float);
-    // matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device);
+
+    printf("The MxM is using %d shared memory\n", (int)sharedMemSize);
+
+    matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device);
     matrixMulAddWMMATolerant<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, tcu_device);
-    // matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M);
+    matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M);
 
     cudaMemcpy(h_D, d_D, float_bytes, cudaMemcpyDeviceToHost);
 
