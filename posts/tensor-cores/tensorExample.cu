@@ -3,6 +3,7 @@
 #include <mma.h>
 
 #define WMMA_TILE   16  // WMMA supports 16x16 tiles
+// #define DEBUG 0
 
 using namespace nvcuda;
 
@@ -179,7 +180,7 @@ __device__ int wmma_diagnosis(
 }
 
 
-__global__ void matrixMulAddWMMATolerant(half* A, half* B, float* C, float* D, int N, int M, int *fault, int* tcu, int TILE_BLOCKS) {
+__global__ void matrixMulAddWMMACorrection(half* A, half* B, float* C, float* D, int N, int M, int *fault, int* tcu, int TILE_BLOCKS) {
     extern __shared__ half sharedMem[];
     half* sharedA = sharedMem;
     half* sharedB = sharedMem + TILE_BLOCKS * WMMA_TILE * WMMA_TILE;
@@ -270,7 +271,7 @@ __global__ void matrixMulAddWMMATolerant(half* A, half* B, float* C, float* D, i
     }
 }
 
-__global__ void matrixMulAddWMMASafe(half* A, half* B, float* C, float* D, int N, int M, int *fault, int TILE_BLOCKS) {
+__global__ void matrixMulAddWMMADetection(half* A, half* B, float* C, float* D, int N, int M, int *fault, int TILE_BLOCKS) {
     extern __shared__ half sharedMem[];
     half* sharedA = sharedMem;
     half* sharedB = sharedMem + TILE_BLOCKS * WMMA_TILE * WMMA_TILE;
@@ -392,6 +393,47 @@ __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, in
     }
 }
 
+// Timing wrapper function
+template <typename Func>
+float measureKernelTime(Func kernel) {
+    cudaEvent_t start, stop;
+    float elapsedTime;
+
+    // Create CUDA events
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Record the start event
+    cudaEventRecord(start, 0);
+
+    // Launch the kernel (passed as a lambda)
+    kernel();
+
+    // Record the stop event
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+
+    // Calculate the elapsed time
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+
+    // Destroy the events
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return elapsedTime;  // Return time in milliseconds
+}
+
+void printfStatistics(int method, int N, float timeMs, int sharedMemory) {
+    // * Calculate TFLOPs
+    double flops = 2.0 * N * N * N;
+    double elapsedTimeInSeconds = timeMs / 1000.0;
+    double tflops = flops / (elapsedTimeInSeconds * 1e12);
+
+    // * method, size, time, shared, flops, tflops
+    // * method 0 - normal, 1 - detection, 2 - correction
+    printf("%d,%d,%2.4f,%d,%2.4f,%2.4f\n", method, N, timeMs, sharedMemory, flops, tflops);
+}
+
 int main(int argc, char* argv[]) {
     // * Must be multiples of 16 for wmma code to work
     if (argv[1] == "") {
@@ -447,11 +489,26 @@ int main(int argc, char* argv[]) {
 
     size_t sharedMemSize = 2 * TILE_BLOCKS * WMMA_TILE * WMMA_TILE * sizeof(half) + WMMA_TILE * WMMA_TILE * sizeof(float);
 
-    printf("The MxM is using %d shared memory\n", (int)sharedMemSize);
+    // * Measure kernel execution time using the wrapper
+    float timeMs = measureKernelTime([&]() {
+        matrixMulAddWMMADetection<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, TILE_BLOCKS);
+    });
 
-    matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, TILE_BLOCKS);
-    matrixMulAddWMMATolerant<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, tcu_device, TILE_BLOCKS);
-    matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, TILE_BLOCKS);
+    printfStatistics(1, N, timeMs, sharedMemSize);
+
+    // * Measure kernel execution time using the wrapper
+    timeMs = measureKernelTime([&]() {
+        matrixMulAddWMMACorrection<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, tcu_device, TILE_BLOCKS);
+    });
+
+    printfStatistics(2, N, timeMs, sharedMemSize);
+
+    // * Measure kernel execution time using the wrapper
+    timeMs = measureKernelTime([&]() {
+        matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, TILE_BLOCKS);
+    });
+
+    printfStatistics(0, N, timeMs, sharedMemSize);
 
     cudaMemcpy(h_D, d_D, float_bytes, cudaMemcpyDeviceToHost);
 
@@ -460,8 +517,9 @@ int main(int argc, char* argv[]) {
 
     if (fault[0] != 0) {
       printf("Fault detected at the TCU %d\n", tcu[0]);
-   }
+    }
 
+#ifdef DEBUG
     std::cout << "Matrix A:" << std::endl;
     printMatrix(h_A, N, M);
 
@@ -473,6 +531,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Matrix D (Result A*B+C):" << std::endl;
     printMatrix(h_D, N, M);
+#endif
 
     cudaFree(d_A);
     cudaFree(d_B);
