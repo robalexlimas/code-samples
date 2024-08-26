@@ -3,7 +3,6 @@
 #include <mma.h>
 
 #define WMMA_TILE   16  // WMMA supports 16x16 tiles
-#define TILE_BLOCKS 32   // How many tiles are loaded inside the shared memory
 
 using namespace nvcuda;
 
@@ -18,7 +17,7 @@ void printMatrix(T* matrix, int N, int M) {
     printf("\n");
 }
 
-__device__ void loadSharedMemory(half* A, half* B, float* C, half* sharedA, half* sharedB, float* sharedC, int N, int M, int tileRow, int tileCol, int sharedTile) {
+__device__ void loadSharedMemory(half* A, half* B, float* C, half* sharedA, half* sharedB, float* sharedC, int N, int M, int tileRow, int tileCol, int sharedTile, int TILE_BLOCKS) {
     // * tile at the warp level for loading shared memory
     for (int wmmaTile = 0; wmmaTile < TILE_BLOCKS * WMMA_TILE; wmmaTile+=WMMA_TILE) {
         // * these values can get values between 0 - TILE_BLOCK * WMMA_TILE
@@ -180,7 +179,7 @@ __device__ int wmma_diagnosis(
 }
 
 
-__global__ void matrixMulAddWMMATolerant(half* A, half* B, float* C, float* D, int N, int M, int *fault, int* tcu) {
+__global__ void matrixMulAddWMMATolerant(half* A, half* B, float* C, float* D, int N, int M, int *fault, int* tcu, int TILE_BLOCKS) {
     extern __shared__ half sharedMem[];
     half* sharedA = sharedMem;
     half* sharedB = sharedMem + TILE_BLOCKS * WMMA_TILE * WMMA_TILE;
@@ -208,7 +207,7 @@ __global__ void matrixMulAddWMMATolerant(half* A, half* B, float* C, float* D, i
         // * tile at the device level
         for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
 
-            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile);
+            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile, TILE_BLOCKS);
 
             __syncthreads();
 
@@ -271,7 +270,7 @@ __global__ void matrixMulAddWMMATolerant(half* A, half* B, float* C, float* D, i
     }
 }
 
-__global__ void matrixMulAddWMMASafe(half* A, half* B, float* C, float* D, int N, int M, int *fault) {
+__global__ void matrixMulAddWMMASafe(half* A, half* B, float* C, float* D, int N, int M, int *fault, int TILE_BLOCKS) {
     extern __shared__ half sharedMem[];
     half* sharedA = sharedMem;
     half* sharedB = sharedMem + TILE_BLOCKS * WMMA_TILE * WMMA_TILE;
@@ -299,7 +298,7 @@ __global__ void matrixMulAddWMMASafe(half* A, half* B, float* C, float* D, int N
         // * tile at the device level
         for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
 
-            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile);
+            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile, TILE_BLOCKS);
 
             __syncthreads();
 
@@ -340,7 +339,7 @@ __global__ void matrixMulAddWMMASafe(half* A, half* B, float* C, float* D, int N
     }
 }
 
-__global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, int M) {
+__global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, int M, int TILE_BLOCKS) {
     extern __shared__ half sharedMem[];
     half* sharedA = sharedMem;
     half* sharedB = sharedMem + TILE_BLOCKS * WMMA_TILE * WMMA_TILE;
@@ -363,7 +362,7 @@ __global__ void matrixMulAddWMMA(half* A, half* B, float* C, float* D, int N, in
         // * tile at the device level
         for (int sharedTile = 0; sharedTile < M; sharedTile += TILE_BLOCKS * WMMA_TILE) {
 
-            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile);
+            loadSharedMemory(A, B, C, sharedA, sharedB, sharedC, N, M, tileRow, tileCol, sharedTile, TILE_BLOCKS);
 
             __syncthreads();
 
@@ -402,6 +401,7 @@ int main(int argc, char* argv[]) {
 
     const int M = atoi(argv[1]);
     const int N = atoi(argv[1]);
+    const int TILE_BLOCKS = atoi(argv[2]);
 
     size_t half_bytes = N * M * sizeof(half);
     size_t float_bytes = N * M * sizeof(float);
@@ -449,9 +449,9 @@ int main(int argc, char* argv[]) {
 
     printf("The MxM is using %d shared memory\n", (int)sharedMemSize);
 
-    matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device);
-    matrixMulAddWMMATolerant<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, tcu_device);
-    matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M);
+    matrixMulAddWMMASafe<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, TILE_BLOCKS);
+    matrixMulAddWMMATolerant<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, tcu_device, TILE_BLOCKS);
+    matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, TILE_BLOCKS);
 
     cudaMemcpy(h_D, d_D, float_bytes, cudaMemcpyDeviceToHost);
 
