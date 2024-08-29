@@ -541,11 +541,15 @@ int main(int argc, char* argv[]) {
     cudaFree(d_B);
     cudaFree(d_C);
     cudaFree(d_D);
+    cudaFree(tcu_device);
+    cudaFree(fault_device);
 
     free(h_A);
     free(h_B);
     free(h_C);
     free(h_D);
+    free(tcu);
+    free(fault);
 
     return 0;
 }
