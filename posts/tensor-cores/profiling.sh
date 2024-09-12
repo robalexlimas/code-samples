@@ -7,7 +7,7 @@
 dir=`pwd`
 echo "Working on $dir"
 
-echo "method,size,time,shared,flops,tflops" > $dir/profile.csv
+echo "method,size,time,shared,flops,tflops,powerBefore,powerAfter" > $dir/profile.csv
 
 echo "Starting to profile the applications"
 

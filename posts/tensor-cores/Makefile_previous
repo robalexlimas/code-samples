@@ -28,7 +28,7 @@
 SM_ARCH ?= 86
 
 all: tensorExample.cu
-	nvcc -o tensorExample -L/usr/local/cuda-11.6/targets/x86_64-linux/lib/stubs/ -lnvidia-ml -arch=sm_$(SM_ARCH) -lcublas -lcurand tensorExample.cu
+	nvcc -o tensorExample -arch=sm_$(SM_ARCH) -lcublas -lcurand tensorExample.cu
 
 clean:
 	rm -f tensorExample

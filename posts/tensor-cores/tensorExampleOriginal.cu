@@ -2,19 +2,11 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <string>
-#include <nvml.h>
 
 #define WMMA_TILE   16  // WMMA supports 16x16 tiles
 // #define DEBUG 0
 
 using namespace nvcuda;
-
-void checkNvmlError(nvmlReturn_t result, const char* msg) {
-    if (result != NVML_SUCCESS) {
-        std::cerr << "Error: " << msg << " - " << nvmlErrorString(result) << std::endl;
-        exit(1);
-    }
-}
 
 template <typename T>
 void printMatrix(T* matrix, int N, int M) {
@@ -432,7 +424,7 @@ float measureKernelTime(Func kernel) {
     return elapsedTime;  // Return time in milliseconds
 }
 
-void printfStatistics(int method, int N, float timeMs, int sharedMemory, float power, float powerBefore) {
+void printfStatistics(int method, int N, float timeMs, int sharedMemory) {
     // * Calculate TFLOPs
     double flops = 2.0 * N * N * N + N * N;
     double elapsedTimeInSeconds = timeMs / 1000.0;
@@ -440,9 +432,9 @@ void printfStatistics(int method, int N, float timeMs, int sharedMemory, float p
 
     // * method, size, time, shared, flops, tflops
     // * method 0 - normal, 1 - detection, 2 - correction
-    if (method == 0) printf("normal,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power);
-    if (method == 1) printf("detection,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power);
-    if (method == 2) printf("correction,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power);
+    if (method == 0) printf("normal,%d,%2.4f,%d,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops);
+    if (method == 1) printf("detection,%d,%2.4f,%d,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops);
+    if (method == 2) printf("correction,%d,%2.4f,%d,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops);
     
 }
 
@@ -452,25 +444,6 @@ int main(int argc, char* argv[]) {
         printf("Matrix size must be initialized, and it must be multiples of 16");
         return 0;
     }
-
-    // Initialize NVML
-    nvmlReturn_t result = nvmlInit();
-    checkNvmlError(result, "Failed to initialize NVML");
-
-    // Get the number of GPUs
-    unsigned int deviceCount;
-    result = nvmlDeviceGetCount(&deviceCount);
-    checkNvmlError(result, "Failed to get device count");
-
-    // Select the first GPU (you can modify this to target a different GPU)
-    nvmlDevice_t device;
-    result = nvmlDeviceGetHandleByIndex(0, &device);
-    checkNvmlError(result, "Failed to get handle for device");
-
-    // Record power usage before kernel execution
-    unsigned int powerBefore;
-    result = nvmlDeviceGetPowerUsage(device, &powerBefore);
-    checkNvmlError(result, "Failed to get power usage");
 
     const int M = atoi(argv[1]);
     const int N = atoi(argv[1]);
@@ -525,32 +498,21 @@ int main(int argc, char* argv[]) {
         matrixMulAddWMMADetection<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, TILE_BLOCKS);
     });
 
-    // Record power usage after kernel execution
-    unsigned int powerAfter;
-    result = nvmlDeviceGetPowerUsage(device, &powerAfter);
-    checkNvmlError(result, "Failed to get power usage");
-
-    printfStatistics(1, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0);
+    printfStatistics(1, N, timeMs, sharedMemSize);
 
     // * Measure kernel execution time using the wrapper
     timeMs = measureKernelTime([&]() {
         matrixMulAddWMMACorrection<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, tcu_device, TILE_BLOCKS);
     });
 
-    result = nvmlDeviceGetPowerUsage(device, &powerAfter);
-    checkNvmlError(result, "Failed to get power usage");
-
-    printfStatistics(2, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0);
+    printfStatistics(2, N, timeMs, sharedMemSize);
 
     // * Measure kernel execution time using the wrapper
     timeMs = measureKernelTime([&]() {
         matrixMulAddWMMA<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, TILE_BLOCKS);
     });
 
-    result = nvmlDeviceGetPowerUsage(device, &powerAfter);
-    checkNvmlError(result, "Failed to get power usage");
-
-    printfStatistics(0, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0);
+    printfStatistics(0, N, timeMs, sharedMemSize);
 
     cudaMemcpy(h_D, d_D, float_bytes, cudaMemcpyDeviceToHost);
 
@@ -574,10 +536,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Matrix D (Result A*B+C):" << std::endl;
     printMatrix(h_D, N, M);
 #endif
-
-    // Shutdown NVML
-    result = nvmlShutdown();
-    checkNvmlError(result, "Failed to shutdown NVML");
 
     cudaFree(d_A);
     cudaFree(d_B);
