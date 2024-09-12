@@ -467,11 +467,6 @@ int main(int argc, char* argv[]) {
     result = nvmlDeviceGetHandleByIndex(0, &device);
     checkNvmlError(result, "Failed to get handle for device");
 
-    // Record power usage before kernel execution
-    unsigned int powerBefore;
-    result = nvmlDeviceGetPowerUsage(device, &powerBefore);
-    checkNvmlError(result, "Failed to get power usage");
-
     const int M = atoi(argv[1]);
     const int N = atoi(argv[1]);
     const int TILE_BLOCKS = atoi(argv[2]);
@@ -519,6 +514,11 @@ int main(int argc, char* argv[]) {
     dim3 gridDim(N / WMMA_TILE, M / WMMA_TILE);
 
     size_t sharedMemSize = 2 * TILE_BLOCKS * WMMA_TILE * WMMA_TILE * sizeof(half) + WMMA_TILE * WMMA_TILE * sizeof(float);
+
+    // Record power usage before kernel execution
+    unsigned int powerBefore;
+    result = nvmlDeviceGetPowerUsage(device, &powerBefore);
+    checkNvmlError(result, "Failed to get power usage");
 
     // * Measure kernel execution time using the wrapper
     float timeMs = measureKernelTime([&]() {
