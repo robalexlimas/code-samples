@@ -432,7 +432,7 @@ float measureKernelTime(Func kernel) {
     return elapsedTime;  // Return time in milliseconds
 }
 
-void printfStatistics(int method, int N, float timeMs, int sharedMemory, float power, float powerBefore) {
+void printfStatistics(int method, int N, float timeMs, int sharedMemory, float power, float powerBefore, int temperatureBefore, int temperatureAfter, int clockBefore, int clockAfter, nvmlPstates_t pStateAfter) {
     // * Calculate TFLOPs
     double flops = 2.0 * N * N * N + N * N;
     double elapsedTimeInSeconds = timeMs / 1000.0;
@@ -440,9 +440,9 @@ void printfStatistics(int method, int N, float timeMs, int sharedMemory, float p
 
     // * method, size, time, shared, flops, tflops
     // * method 0 - normal, 1 - detection, 2 - correction
-    if (method == 0) printf("normal,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power);
-    if (method == 1) printf("detection,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power);
-    if (method == 2) printf("correction,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power);
+    if (method == 0) printf("normal,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f,%d,%d,%d,%d,%d\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power, temperatureBefore, temperatureAfter, clockBefore, clockAfter, (unsigned int)pStateAfter);
+    if (method == 1) printf("detection,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f,%d,%d,%d,%d,%d\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power, temperatureBefore, temperatureAfter, clockBefore, clockAfter, (unsigned int)pStateAfter);
+    if (method == 2) printf("correction,%d,%2.4f,%d,%2.4f,%2.4f,%2.4f,%2.4f,%d,%d,%d,%d,%d\n", N, timeMs, sharedMemory, flops, tflops, powerBefore, power, temperatureBefore, temperatureAfter, clockBefore, clockAfter, (unsigned int)pStateAfter);
     
 }
 
@@ -520,6 +520,21 @@ int main(int argc, char* argv[]) {
     result = nvmlDeviceGetPowerUsage(device, &powerBefore);
     checkNvmlError(result, "Failed to get power usage");
 
+    // Get temperature before kernel execution
+    unsigned int temperatureBefore;
+    result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &temperatureBefore);
+    checkNvmlError(result, "Failed to get temperature");
+
+    // Get GPU clock frequency before kernel execution
+    unsigned int clockBefore;
+    result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_GRAPHICS, &clockBefore);
+    checkNvmlError(result, "Failed to get GPU clock frequency");
+    
+    // Get P-state (performance state) before kernel execution
+    nvmlPstates_t pStateBefore;
+    result = nvmlDeviceGetPerformanceState(device, &pStateBefore);
+    checkNvmlError(result, "Failed to get performance state");
+
     // * Measure kernel execution time using the wrapper
     float timeMs = measureKernelTime([&]() {
         matrixMulAddWMMADetection<<<gridDim, blockDim, sharedMemSize>>>(d_A, d_B, d_C, d_D, N, M, fault_device, TILE_BLOCKS);
@@ -530,7 +545,22 @@ int main(int argc, char* argv[]) {
     result = nvmlDeviceGetPowerUsage(device, &powerAfter);
     checkNvmlError(result, "Failed to get power usage");
 
-    printfStatistics(1, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0);
+    // Get temperature after kernel execution
+    unsigned int temperatureAfter;
+    result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &temperatureAfter);
+    checkNvmlError(result, "Failed to get temperature");
+
+    // Get GPU clock frequency after kernel execution
+    unsigned int clockAfter;
+    result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_GRAPHICS, &clockAfter);
+    checkNvmlError(result, "Failed to get GPU clock frequency");
+
+    // Get P-state (performance state) after kernel execution
+    nvmlPstates_t pStateAfter;
+    result = nvmlDeviceGetPerformanceState(device, &pStateAfter);
+    checkNvmlError(result, "Failed to get performance state");
+
+    printfStatistics(1, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0, temperatureBefore, temperatureAfter, clockBefore, clockAfter, pStateAfter);
 
     // * Measure kernel execution time using the wrapper
     timeMs = measureKernelTime([&]() {
@@ -540,7 +570,19 @@ int main(int argc, char* argv[]) {
     result = nvmlDeviceGetPowerUsage(device, &powerAfter);
     checkNvmlError(result, "Failed to get power usage");
 
-    printfStatistics(2, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0);
+    // Get temperature after kernel execution
+    result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &temperatureAfter);
+    checkNvmlError(result, "Failed to get temperature");
+
+    // Get GPU clock frequency after kernel execution
+    result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_GRAPHICS, &clockAfter);
+    checkNvmlError(result, "Failed to get GPU clock frequency");
+
+    // Get P-state (performance state) after kernel execution
+    result = nvmlDeviceGetPerformanceState(device, &pStateAfter);
+    checkNvmlError(result, "Failed to get performance state");
+
+    printfStatistics(2, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0, temperatureBefore, temperatureAfter, clockBefore, clockAfter, pStateAfter);
 
     // * Measure kernel execution time using the wrapper
     timeMs = measureKernelTime([&]() {
@@ -550,7 +592,19 @@ int main(int argc, char* argv[]) {
     result = nvmlDeviceGetPowerUsage(device, &powerAfter);
     checkNvmlError(result, "Failed to get power usage");
 
-    printfStatistics(0, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0);
+    // Get temperature after kernel execution
+    result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &temperatureAfter);
+    checkNvmlError(result, "Failed to get temperature");
+
+    // Get GPU clock frequency after kernel execution
+    result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_GRAPHICS, &clockAfter);
+    checkNvmlError(result, "Failed to get GPU clock frequency");
+
+    // Get P-state (performance state) after kernel execution
+    result = nvmlDeviceGetPerformanceState(device, &pStateAfter);
+    checkNvmlError(result, "Failed to get performance state");
+
+    printfStatistics(0, N, timeMs, sharedMemSize, powerAfter / 1000.0, powerBefore / 1000.0, temperatureBefore, temperatureAfter, clockBefore, clockAfter, pStateAfter);
 
     cudaMemcpy(h_D, d_D, float_bytes, cudaMemcpyDeviceToHost);
 
